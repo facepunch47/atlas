@@ -39,8 +39,8 @@ fn all() -> Vec<Recipe> {
 #[test]
 fn the_whole_corpus_reads() {
     let all = all();
-    assert_eq!(all.len(), 25);
-    assert_eq!(all.iter().filter(|r| r.is_atlas()).count(), 23);
+    assert_eq!(all.len(), 27);
+    assert_eq!(all.iter().filter(|r| r.is_atlas()).count(), 25);
     assert_eq!(
         all.iter().filter(|r| r.version == "1").count(),
         2,
@@ -82,7 +82,67 @@ fn every_atlas_recipe_produces_a_valid_serve_config() {
             .unwrap_or_else(|e| panic!("{}: {e:#}", r.id));
         checked += 1;
     }
-    assert_eq!(checked, 23);
+    assert_eq!(checked, 25);
+}
+
+fn must(id: &str) -> Recipe {
+    all()
+        .into_iter()
+        .find(|r| r.id == id)
+        .unwrap_or_else(|| panic!("missing vendored recipe {id}"))
+}
+
+/// FAST diet-8k and INTEL are sibling stems of the same NVFP4 35B checkpoint.
+/// Their `defaults:` must stay byte-faithful to the spark-9f9e measured park
+/// (2026-08-11). Inventing a flag or collapsing them into one always-disable-
+/// thinking doc is the failure this test exists to prevent.
+#[test]
+fn qwen36_nvfp4_diet_8k_and_intel_match_the_measured_park() {
+    let diet = must("qwen3.6/qwen3.6-35b-a3b-nvfp4-diet-8k");
+    let intel = must("qwen3.6/qwen3.6-35b-a3b-nvfp4-intel");
+
+    assert_eq!(diet.model, "nvidia/Qwen3.6-35B-A3B-NVFP4");
+    assert_eq!(intel.model, diet.model);
+    assert_eq!(diet.min_nodes, 1);
+    assert_eq!(intel.min_nodes, 1);
+
+    for key in [
+        "kv_cache_dtype",
+        "kv_high_precision_layers",
+        "scheduling_policy",
+        "speculative",
+        "num_drafts",
+        "enable_prefix_caching",
+        "tool_call_parser",
+    ] {
+        assert_eq!(
+            diet.defaults.get(key),
+            intel.defaults.get(key),
+            "{key} is shared KV/spec/parser stack"
+        );
+    }
+    assert_eq!(diet.defaults["kv_cache_dtype"], "fp8");
+    assert_eq!(diet.defaults["kv_high_precision_layers"], "auto");
+    assert_eq!(diet.defaults["scheduling_policy"], "slai");
+    assert_eq!(diet.defaults["speculative"], "true");
+    assert_eq!(diet.defaults["num_drafts"], "1");
+    assert_eq!(diet.defaults["enable_prefix_caching"], "true");
+    assert_eq!(diet.defaults["tool_call_parser"], "qwen3_coder");
+
+    assert_eq!(diet.defaults["disable_thinking"], "true");
+    assert_eq!(diet.defaults["gpu_memory_utilization"], "0.40");
+    assert_eq!(diet.defaults["max_model_len"], "8192");
+
+    assert_eq!(intel.defaults["disable_thinking"], "false");
+    assert_eq!(intel.defaults["gpu_memory_utilization"], "0.55");
+    assert_eq!(intel.defaults["max_model_len"], "32768");
+
+    let empty = BTreeMap::new();
+    diet.serve_args(&empty)
+        .unwrap_or_else(|e| panic!("diet-8k not servable: {e:#}"));
+    intel
+        .serve_args(&empty)
+        .unwrap_or_else(|e| panic!("intel not servable: {e:#}"));
 }
 
 #[test]
