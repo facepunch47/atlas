@@ -80,6 +80,7 @@ use decode_step::*;
 use emit_step::*;
 pub use helpers::WatchdogParams;
 pub(crate) use helpers::parse_disable_watchdogs;
+pub use helpers::resolve_content_loop_watchdog;
 use helpers::*;
 pub use helpers::{CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN};
 use lifecycle::*;
@@ -641,13 +642,11 @@ pub fn run(
             // window sidesteps them while leaving the high-accept answer body
             // speculated. N=0 preserves exact prior behavior.
             let dflash_resume_guard = sched.levers.dflash_resume_guard;
-            // ATLAS_DFLASH_SPEC_THINK=1: speculate INSIDE think blocks (vLLM
-            // semantics — reference measures 45% draft acceptance on thinking,
-            // 2026-07-07 calibration). Bypasses the think-gate AND the resume
-            // guard: output is coherent but not byte-lossless vs no-spec (the
-            // batch-K numerics floor can flip a low-margin token mid-think),
-            // and thinking-budget forced-end is not enforced on the raw-argmax
-            // verify path. Throughput mode; leave OFF for byte-proof runs.
+            // ATLAS_DFLASH_SPEC_THINK=1: DFlash raw-argmax may speculate
+            // inside `<think>`. Standard MTP already verifies during think.
+            // DFlash raw-argmax does not run ForcedThinkEnd, so it stays
+            // serial-in-think unless this lever is on. Resume guard still
+            // serial-decodes the spec-entry window.
             let dflash_spec_think = sched.levers.dflash_spec_think;
             // Spec dispatch additionally requires every active sequence's
             // SSM slot to be covered by the MTP verify state pools
@@ -692,24 +691,22 @@ pub fn run(
                 && spec_width_ok
                 && spec_slots_covered
                 && (
-                    // SPEC_THINK: speculate everywhere EXCEPT the first
-                    // `dflash_resume_guard` generated tokens — every observed
-                    // T=0 flip (2026-07-07/08) fires within ~7 tokens of spec
-                    // ENTRY (sequence start or post-think resume); serial-
-                    // decoding the entry window dodges the divergence while
-                    // leaving the body speculated.
-                    // EVERY active sequence must be eligible, not just active[0].
-                    // These are per-sequence properties: with more than one
-                    // sequence speculating, reading them off active[0] lets
-                    // sequence 1 be speculated while its own suppress_tool_call
-                    // / disable_mtp / thinking state says it must not be. At
-                    // n==1 `all()` over one element is exactly the old
-                    // predicate, so the single-sequence path is unchanged.
+                    // Standard MTP verifies during `<think>` (same machine as
+                    // thinking-off). DFlash raw-argmax stays serial-in-think
+                    // unless ATLAS_DFLASH_SPEC_THINK=1. Resume guard still
+                    // serial-decodes the spec-entry window. EVERY active
+                    // sequence must be eligible, not just active[0].
                     active.iter().all(|a| {
-                        ((dflash_spec_think && a.output_tokens.len() as u32 >= dflash_resume_guard)
-                            || (!a.inside_thinking && a.post_think_emitted >= dflash_resume_guard))
-                            && !a.suppress_tool_call
-                            && !a.disable_mtp
+                        mtp_gate::spec_dispatch_eligible(
+                            a.inside_thinking,
+                            a.post_think_emitted,
+                            a.output_tokens.len() as u32,
+                            a.suppress_tool_call,
+                            a.disable_mtp,
+                            dflash_spec_think,
+                            dflash_resume_guard,
+                            dflash_verify_raw_argmax,
+                        )
                     })
                 )
             {
@@ -723,87 +720,136 @@ pub fn run(
                 // A/B 2026-07-20: always-on Σ1028s/10-10 vs timing-gated
                 // Σ1846s/9-10).
                 if let Some(gate) = mtp_gate.as_mut() {
-                    gate.maybe_remeasure(active[0].seq.seq_len);
-                    gate.note_depth(active[0].seq.seq_len);
-                    match gate.next_step() {
-                        mtp_gate::GateStep::MeasureDecode => {
-                            let t0 = std::time::Instant::now();
-                            step_decode_only(
-                                &*model,
-                                &mut active,
-                                think_end_token,
-                                think_start_token,
-                                code_fence_token,
-                                tool_call_start_token,
-                                tool_call_end_token,
-                                adaptive_sampling,
-                                &sched,
-                            );
-                            gate.record_decode(t0.elapsed());
-                            // ATLAS_MTP_CATCHUP: ring the serially decoded
-                            // token's hidden so the next MTP re-probe can
-                            // batch-feed the drafter over the serial gap
-                            // (no-op when the feature is off).
-                            //
-                            // LABEL CONVENTION (off-by-one fixed 2026-07-21).
-                            // The reader feeds drafter pair key `k` from ring
-                            // label `k + 1`, because pair key k is
-                            // `(embed(t_{k+1}), hidden_k)` — so label n must
-                            // hold `hidden_{n-1}`, the hidden that PREDICTED
-                            // token n. `step_decode_only` forwards
-                            // `last_token` at the OLD `seq_len` and only then
-                            // pushes that input token and increments
-                            // (`decode_a2.rs` / `decode_b.rs`: `tokens.push`
-                            // + `seq_len += 1`). So the hidden now in row 0 is
-                            // `hidden_{seq_len - 1}` and its label is
-                            // `seq_len`, not `seq_len - 1`.
-                            //
-                            // This previously wrote `seq_len - 1`, which handed
-                            // every serially-fed pair key the hidden of the
-                            // NEXT position. It is the same quantity the K=3
-                            // re-feed labels `base + t + 1` for verify row t at
-                            // position `base + t` — that convention is verified
-                            // by dumped hidden fingerprints (93/93 cross-step,
-                            // see `speculative::mtp_refeed_accepted_enabled`),
-                            // so the serial hook was the side that disagreed.
-                            //
-                            // Multi-seq guard (batched-MTP E2): the catchup
-                            // ring is a SINGLE-sequence structure (one ring,
-                            // one label space). With n active sequences the
-                            // hidden in row 0 belongs to an arbitrary member
-                            // of the batch, so ringing it would interleave
-                            // unrelated hiddens under one label space.
-                            // (`mtp_catchup_enabled` is also force-off when
-                            // ATLAS_MTP_MAX_SEQS > 1 — this guard keeps the
-                            // save itself single-seq-only regardless.)
-                            if active.len() == 1
-                                && let Err(e) =
-                                    model.save_hidden_for_catchup(0, active[0].seq.seq_len)
-                            {
-                                tracing::warn!("save_hidden_for_catchup: {e:#}");
-                            }
+                    if gate.maybe_remeasure(active[0].seq.seq_len) {
+                        for a in active.iter_mut() {
+                            a.mtp_acct.note_regime_reprobe();
                         }
-                        mtp_gate::GateStep::MeasureVerify => {
-                            // A bootstrap-only step (no pending drafts) emits
-                            // 1 token and proposes; its cost is charged to the
-                            // MTP mode — proposing IS part of what MTP costs.
-                            // Sum over ALL speculating sequences: the gate arbitrates
-                            // on tokens-per-second, so counting only active[0]
-                            // under-reports MTP's throughput by a factor of n and
-                            // biases the gate toward serial decode.
-                            let seq_len_before: usize = active.iter().map(|a| a.seq.seq_len).sum();
-                            let t0 = std::time::Instant::now();
-                            step_mtp(
-                                &*model,
-                                &mut active,
-                                &sched,
-                                num_drafts,
-                                &verify_ctx,
-                                dflash_verify_raw_argmax,
-                            );
-                            let seq_len_after: usize = active.iter().map(|a| a.seq.seq_len).sum();
-                            let emitted = seq_len_after.saturating_sub(seq_len_before);
-                            gate.record_verify_step(t0.elapsed(), emitted);
+                    }
+                    gate.note_depth(active[0].seq.seq_len);
+                    // Spec-entry pin: the first N post-`</think>` tokens run
+                    // the verify path even when the gate's arbitration says
+                    // Serial, so the answer OPENING cannot flip between the
+                    // serial and batch-K forwards on wall-clock luck (see
+                    // `mtp_gate::entry_pin_forces_verify` for the measured
+                    // flip evidence). Pinned steps are deliberately NOT
+                    // recorded: charging verify walls to a Serial-mode
+                    // accumulator would corrupt the arbitration baselines,
+                    // and ≤N unmeasured steps per sequence merely delay the
+                    // reprobe cadence by the same handful of tokens.
+                    let min_post_think_emitted = active
+                        .iter()
+                        .map(|a| a.post_think_emitted)
+                        .min()
+                        .unwrap_or(u32::MAX);
+                    if mtp_gate::entry_pin_forces_verify(min_post_think_emitted)
+                        && gate.next_step() == mtp_gate::GateStep::MeasureDecode
+                    {
+                        let lens_before: Vec<usize> =
+                            active.iter().map(|a| a.seq.seq_len).collect();
+                        step_mtp(
+                            &*model,
+                            &mut active,
+                            &sched,
+                            num_drafts,
+                            &verify_ctx,
+                            dflash_verify_raw_argmax,
+                        );
+                        for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                            a.mtp_acct
+                                .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
+                        }
+                    } else {
+                        match gate.next_step() {
+                            mtp_gate::GateStep::MeasureDecode => {
+                                let t0 = std::time::Instant::now();
+                                step_decode_only(
+                                    &*model,
+                                    &mut active,
+                                    think_end_token,
+                                    think_start_token,
+                                    code_fence_token,
+                                    tool_call_start_token,
+                                    tool_call_end_token,
+                                    adaptive_sampling,
+                                    &sched,
+                                );
+                                gate.record_decode(t0.elapsed());
+                                for a in active.iter_mut() {
+                                    a.mtp_acct.record_serial();
+                                }
+                                // ATLAS_MTP_CATCHUP: ring the serially decoded
+                                // token's hidden so the next MTP re-probe can
+                                // batch-feed the drafter over the serial gap
+                                // (no-op when the feature is off).
+                                //
+                                // LABEL CONVENTION (off-by-one fixed 2026-07-21).
+                                // The reader feeds drafter pair key `k` from ring
+                                // label `k + 1`, because pair key k is
+                                // `(embed(t_{k+1}), hidden_k)` — so label n must
+                                // hold `hidden_{n-1}`, the hidden that PREDICTED
+                                // token n. `step_decode_only` forwards
+                                // `last_token` at the OLD `seq_len` and only then
+                                // pushes that input token and increments
+                                // (`decode_a2.rs` / `decode_b.rs`: `tokens.push`
+                                // + `seq_len += 1`). So the hidden now in row 0 is
+                                // `hidden_{seq_len - 1}` and its label is
+                                // `seq_len`, not `seq_len - 1`.
+                                //
+                                // This previously wrote `seq_len - 1`, which handed
+                                // every serially-fed pair key the hidden of the
+                                // NEXT position. It is the same quantity the K=3
+                                // re-feed labels `base + t + 1` for verify row t at
+                                // position `base + t` — that convention is verified
+                                // by dumped hidden fingerprints (93/93 cross-step,
+                                // see `speculative::mtp_refeed_accepted_enabled`),
+                                // so the serial hook was the side that disagreed.
+                                //
+                                // Multi-seq guard (batched-MTP E2): the catchup
+                                // ring is a SINGLE-sequence structure (one ring,
+                                // one label space). With n active sequences the
+                                // hidden in row 0 belongs to an arbitrary member
+                                // of the batch, so ringing it would interleave
+                                // unrelated hiddens under one label space.
+                                // (`mtp_catchup_enabled` is also force-off when
+                                // ATLAS_MTP_MAX_SEQS > 1 — this guard keeps the
+                                // save itself single-seq-only regardless.)
+                                if active.len() == 1
+                                    && let Err(e) =
+                                        model.save_hidden_for_catchup(0, active[0].seq.seq_len)
+                                {
+                                    tracing::warn!("save_hidden_for_catchup: {e:#}");
+                                }
+                            }
+                            mtp_gate::GateStep::MeasureVerify => {
+                                // A bootstrap-only step (no pending drafts) emits
+                                // 1 token and proposes; its cost is charged to the
+                                // MTP mode — proposing IS part of what MTP costs.
+                                // Sum over ALL speculating sequences: the gate arbitrates
+                                // on tokens-per-second, so counting only active[0]
+                                // under-reports MTP's throughput by a factor of n and
+                                // biases the gate toward serial decode.
+                                let lens_before: Vec<usize> =
+                                    active.iter().map(|a| a.seq.seq_len).collect();
+                                let t0 = std::time::Instant::now();
+                                step_mtp(
+                                    &*model,
+                                    &mut active,
+                                    &sched,
+                                    num_drafts,
+                                    &verify_ctx,
+                                    dflash_verify_raw_argmax,
+                                );
+                                let emitted: usize = active
+                                    .iter()
+                                    .zip(lens_before.iter())
+                                    .map(|(a, &b)| a.seq.seq_len.saturating_sub(b))
+                                    .sum();
+                                gate.record_verify_step(t0.elapsed(), emitted);
+                                for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                                    a.mtp_acct
+                                        .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
+                                }
+                            }
                         }
                     }
                     // One-time transition work when the gate switches to
@@ -822,6 +868,7 @@ pub fn run(
                     }
                 } else {
                     // Gate bypassed (ATLAS_MTP_GATE_FORCE=1): plain MTP.
+                    let lens_before: Vec<usize> = active.iter().map(|a| a.seq.seq_len).collect();
                     step_mtp(
                         &*model,
                         &mut active,
@@ -830,6 +877,10 @@ pub fn run(
                         &verify_ctx,
                         dflash_verify_raw_argmax,
                     );
+                    for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                        a.mtp_acct
+                            .record_verify_emitted(a.seq.seq_len.saturating_sub(b));
+                    }
                 }
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.
@@ -857,6 +908,9 @@ pub fn run(
                     adaptive_sampling,
                     &sched,
                 );
+                for a in active.iter_mut() {
+                    a.mtp_acct.record_serial();
+                }
             }
         }
 
