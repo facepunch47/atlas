@@ -6,10 +6,21 @@
 //! A thinking-on request used to fail this predicate for the entire
 //! `<think>` span (`inside_thinking && !dflash_spec_think`), which sent
 //! every think token through `step_decode_only`. That is a different
-//! machine from thinking-off (MTP K-verify). Standard MTP verify still
-//! runs [`crate::scheduler::logit_processors::forced_think_end`], so
+//! machine from thinking-off (MTP K-verify) and is the 22→6 tok/s
+//! collapse on Qwen3.8-27B (recipe serve is thinking ON:
+//! `[behavior].thinking_default = true`, `max_thinking_budget = 2048`).
+//! The throughput-arbitrated gate (#337 / #344 / #242 / d6171c4) is
+//! already shipped and is not this predicate — `maybe_remeasure` only
+//! runs once a sequence is already on the MTP branch.
+//!
+//! Standard MTP verify still runs
+//! [`crate::scheduler::logit_processors::forced_think_end`], so
 //! thinking-budget injection stays on the verify path. DFlash raw-argmax
 //! does not, and stays serial-in-think unless `ATLAS_DFLASH_SPEC_THINK=1`.
+//!
+//! #517 (90% think cap from raw `max_tokens` before `--tool-max-tokens`
+//! shrink) can let a tool turn think for ~900 tokens. That is think
+//! *length*, not the tok/s collapse — cite, do not fix here.
 
 /// Whether this sequence may take the MTP verify path on this step.
 pub(super) fn mtp_spec_eligible(

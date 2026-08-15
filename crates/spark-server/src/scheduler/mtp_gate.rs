@@ -26,12 +26,16 @@
 //! - While in Serial, re-probe MTP after [`reprobe_tokens`] emitted tokens.
 //!   While in Mtp, refresh the serial baseline after
 //!   [`serial_refresh_tokens`] (one window ≈ ≤0.3% overhead bound).
-//! - A depth-regime change (factor [`REMEASURE_DEPTH_FACTOR`]) marks
-//!   baselines stale. It does **not** pull a serial probe forward — a
-//!   300–1000 token think that crosses the depth floor must stay on the
-//!   current mode. The other mode refreshes on its normal cadence. A
-//!   stale other-mode EWMA cannot win a switch (that is how a short-
-//!   context serial baseline used to dump a long think into serial).
+//! - A depth-regime change (factor [`REMEASURE_DEPTH_FACTOR`] = 2, floor
+//!   [`REMEASURE_DEPTH_FLOOR`] = 512 — first crossing at 1024; a 2048-token
+//!   3.8 think can cross twice, 4× from the floor) marks baselines stale.
+//!   The shipped gate (#337 / #344 / #242 / d6171c4) also pulled the next
+//!   probe forward. That pull-forward is removed here: a long think must
+//!   stay on the current mode. The other mode refreshes on its normal
+//!   cadence. A stale other-mode EWMA cannot win a switch (that is how a
+//!   short-context serial baseline used to dump a long think into serial).
+//!   This is not a new gate and does not close a 2× decode-wall report
+//!   (#519 is GEMV LUT staging, ~13%, a different machine).
 //!
 //! `ATLAS_MTP_GATE_FORCE=1` (existing) bypasses the gate entirely.
 

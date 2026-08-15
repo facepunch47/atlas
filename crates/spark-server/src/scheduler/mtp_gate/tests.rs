@@ -191,6 +191,11 @@ fn depth_change_marks_stale_without_forced_probe() {
 
 /// A 300–1000 token think that crosses the depth-regime floor must not
 /// spend a dominating fraction of the turn in a serial measurement window.
+///
+/// 3.8 `max_thinking_budget = 2048`; #517 can also produce a ~900-token
+/// think (90% of raw `max_tokens` before tool shrink). Those are *length*.
+/// The shipped gate's first crossing is still 1024 (factor 2, floor 512).
+/// This test is the rate question: regime change must not force serial.
 #[test]
 fn long_decode_regime_change_does_not_dominate_with_serial() {
     let mut g = MtpGate::new(1);
@@ -230,6 +235,53 @@ fn long_decode_regime_change_does_not_dominate_with_serial() {
     );
     assert!(!g.in_serial_mode());
     assert_eq!(g.regime_reprobe_count(), 1);
+}
+
+/// 3.8 `max_thinking_budget = 2048` can cross the floor twice (512→1024→2048).
+/// Shipped refresh cadence may open one 16-step window per 1024 MTP tokens.
+/// Regime crossings must not add a forced serial dump on top of that.
+#[test]
+fn think_budget_2048_two_crossings_do_not_dump_serial() {
+    let mut g = MtpGate::new(1);
+    let mut depth = 64usize;
+    g.note_depth(depth);
+    let mut serial_steps = 0usize;
+    let mut mtp_steps = 0usize;
+    let mut tokens = 0usize;
+    while tokens < 2048 {
+        g.note_depth(depth);
+        let _ = g.maybe_remeasure(depth);
+        match g.next_step() {
+            GateStep::MeasureVerify => {
+                g.record_verify_step(ms(50), 2);
+                mtp_steps += 1;
+                tokens += 2;
+                depth += 2;
+            }
+            GateStep::MeasureDecode => {
+                g.record_decode(ms(50));
+                serial_steps += 1;
+                tokens += 1;
+                depth += 1;
+            }
+        }
+    }
+    let serial_frac = serial_steps as f64 / (serial_steps + mtp_steps) as f64;
+    assert_eq!(
+        g.regime_reprobe_count(),
+        2,
+        "expected 1024 and 2048 crossings, got {}",
+        g.regime_reprobe_count()
+    );
+    assert!(
+        serial_steps <= WINDOW_STEPS * 2,
+        "shipped refresh is ≤16 steps / 1024 tok; got {serial_steps} serial / {mtp_steps} mtp"
+    );
+    assert!(
+        serial_frac < 0.05,
+        "serial must not dominate a 2048-token think (frac={serial_frac:.3})"
+    );
+    assert!(!g.in_serial_mode());
 }
 
 #[test]
