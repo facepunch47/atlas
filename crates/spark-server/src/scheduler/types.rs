@@ -327,6 +327,8 @@ pub(super) struct ActiveSeq {
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): when true, MTP speculative decoding is bypassed.
     pub disable_mtp: bool,
+    /// Per-request serial-vs-MTP step counters for the Done-line.
+    pub decode_acct: super::decode_acct::DecodeAcct,
     /// True after the first non-thinking content token has been generated.
     pub content_started: bool,
     /// Number of content tokens emitted post-`</think>`.
@@ -484,6 +486,8 @@ pub(super) struct SwappedSeq {
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): MTP-disable flag preserved across snapshot/restore.
     pub disable_mtp: bool,
+    /// Per-request decode-path counters, preserved across spill/restore.
+    pub decode_acct: super::decode_acct::DecodeAcct,
     pub content_started: bool,
     pub content_tokens: u32,
     pub prose_tokens_since_last_tool: u32,

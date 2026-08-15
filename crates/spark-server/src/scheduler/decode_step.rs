@@ -141,9 +141,10 @@ pub fn step_decode_only(
         return;
     }
 
-    // Ctx-holes fix (ATLAS_DFLASH_SERIAL_APPEND=1): think-gated stretches
-    // route HERE (mod.rs sends `inside_thinking` seqs to step_decode_only,
-    // never the mtp bootstrap), so their captured target hiddens were
+    // Ctx-holes fix (ATLAS_DFLASH_SERIAL_APPEND=1): DFlash raw-argmax
+    // think-gated stretches route HERE (standard MTP now verifies inside
+    // `<think>`; only DFlash-without-SPEC_THINK stays serial-in-think),
+    // so their captured target hiddens were
     // overwritten and permanently lost — the dominant ctx hole: a 270-token
     // think stretch leaves the drafter conditioned on the prompt alone
     // (observed GAP≈290 at first propose, accept ≤6%). Append each decoded

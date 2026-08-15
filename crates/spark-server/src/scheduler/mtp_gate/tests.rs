@@ -165,27 +165,97 @@ fn serial_mode_reprobes_mtp_and_recovers() {
 }
 
 #[test]
-fn depth_change_schedules_early_probe_without_state_wipe() {
+fn depth_change_marks_stale_without_forced_probe() {
     let mut g = MtpGate::new(1);
     g.note_depth(600);
     // A few MTP windows at depth 600.
     drive_mtp(&mut g, WINDOW_STEPS * 2, 2, ms(50));
     let tps_before = g.mtp_tps_debug();
     assert!(tps_before.is_some());
-    // Depth doubles: baselines stale, probe due immediately, EWMA retained.
-    g.maybe_remeasure(1300);
+    // Depth doubles: baselines stale, EWMA retained, NO serial probe.
+    assert!(g.maybe_remeasure(1300));
+    assert_eq!(g.regime_reprobe_count(), 1);
     assert_eq!(
         g.mtp_tps_debug(),
         tps_before,
         "no state wipe on regime change"
     );
-    // The probe-due condition closes the window on the very next step.
     drive_mtp(&mut g, 1, 2, ms(50));
     assert_eq!(
         g.next_step(),
-        GateStep::MeasureDecode,
-        "stale regime must probe soon"
+        GateStep::MeasureVerify,
+        "regime change must not force a serial probe"
     );
+    assert!(!g.is_probing());
+}
+
+/// A 300–1000 token think that crosses the depth-regime floor must not
+/// spend a dominating fraction of the turn in a serial measurement window.
+#[test]
+fn long_decode_regime_change_does_not_dominate_with_serial() {
+    let mut g = MtpGate::new(1);
+    g.note_depth(200);
+    // 200 tokens of MTP — well under the 1024-token refresh cadence.
+    drive_mtp(&mut g, 100, 2, ms(50));
+    assert_eq!(g.next_step(), GateStep::MeasureVerify);
+    // Cross the floor (512 → 1300). This is the 300–1000 token think case.
+    assert!(g.maybe_remeasure(1300));
+    let mut serial_steps = 0usize;
+    let mut mtp_steps = 0usize;
+    let mut tokens = 200usize;
+    // Continue to 1000 emitted tokens. Natural refresh is at 1024, so a
+    // well-behaved gate stays on MTP for the rest of this turn.
+    while tokens < 1000 {
+        match g.next_step() {
+            GateStep::MeasureVerify => {
+                g.record_verify_step(ms(50), 2);
+                mtp_steps += 1;
+                tokens += 2;
+            }
+            GateStep::MeasureDecode => {
+                g.record_decode(ms(50));
+                serial_steps += 1;
+                tokens += 1;
+            }
+        }
+    }
+    let serial_frac = serial_steps as f64 / (serial_steps + mtp_steps) as f64;
+    assert_eq!(
+        serial_steps, 0,
+        "regime change opened a serial window ({serial_steps} serial / {mtp_steps} mtp)"
+    );
+    assert!(
+        serial_frac < 0.05,
+        "serial measurement must not dominate a 1000-token turn (frac={serial_frac:.3})"
+    );
+    assert!(!g.in_serial_mode());
+    assert_eq!(g.regime_reprobe_count(), 1);
+}
+
+#[test]
+fn stale_other_baseline_cannot_steal_mode() {
+    let mut g = MtpGate::new(1);
+    // MTP 2 tok / 50ms = 40 tok/s. Serial probe at 25 tok/s — stay MTP.
+    run_mtp_until_probe(&mut g, 2, ms(50));
+    drive_serial(&mut g, WINDOW_STEPS, ms(40));
+    assert!(!g.in_serial_mode());
+    assert!(g.serial_tps_debug().is_some());
+    // Regime change: serial EWMA is now stale. Degrade MTP to 10 tok/s
+    // (2 tok / 200ms) — faster than a switch onto the stale 25 tok/s
+    // serial baseline would have been, and exactly the failure the
+    // stale-other guard exists to prevent.
+    assert!(g.maybe_remeasure(2000));
+    for _ in 0..(WINDOW_STEPS * SWITCH_DWELL_WINDOWS * 2) {
+        if g.next_step() != GateStep::MeasureVerify {
+            break;
+        }
+        g.record_verify_step(ms(200), 2);
+    }
+    assert!(
+        !g.in_serial_mode(),
+        "a stale serial baseline must not win a switch after a depth-regime change"
+    );
+    assert_eq!(g.take_fresh_decision(), None);
 }
 
 #[test]
