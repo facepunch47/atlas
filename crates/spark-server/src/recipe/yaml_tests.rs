@@ -94,7 +94,8 @@ fn the_document_must_be_a_mapping() {
 
 /// The census test: every real recipe must parse, and expose the blocks the
 /// rest of the feature reads. Fixtures are vendored, so this never hits the
-/// network and cannot drift when the upstream repo moves.
+/// network and cannot drift when the upstream repo moves. Count includes the
+/// two measured NVFP4 35B siblings (`diet-8k` FAST, `intel`).
 #[test]
 fn all_vendored_recipes_parse() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recipes");
@@ -128,5 +129,5 @@ fn all_vendored_recipes_parse() {
             count += 1;
         }
     }
-    assert_eq!(count, 25, "the vendored corpus is 25 recipes");
+    assert_eq!(count, 27, "the vendored corpus is 27 recipes");
 }
