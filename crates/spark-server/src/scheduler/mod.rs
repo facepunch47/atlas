@@ -33,12 +33,14 @@ mod logit_processors;
 mod logprobs;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
+mod decode_acct;
 pub mod dumps;
 pub mod levers;
 pub mod limits;
 mod mtp_accept_debug;
 mod mtp_bootstrap_step;
 mod mtp_dcut;
+mod mtp_elig;
 mod mtp_gate;
 mod mtp_step;
 pub(crate) mod mtp_timing;
@@ -73,6 +75,7 @@ pub mod vocab_masks;
 
 use beam_prefill::resolve_beam_hyp;
 use confidence::*;
+pub(super) use decode_acct::DecodeAcct;
 use decode_logits_content::*;
 use decode_logits_seq::*;
 use decode_logits_step::*;
@@ -86,6 +89,7 @@ use lifecycle::*;
 use logprobs::*;
 use mod_helpers::*;
 use mtp_bootstrap_step::*;
+use mtp_elig::mtp_spec_eligible;
 use mtp_step::*;
 use phase_continue_prefills::continue_in_progress_prefills;
 use phase_start_prefills::start_new_requests;
@@ -641,13 +645,14 @@ pub fn run(
             // window sidesteps them while leaving the high-accept answer body
             // speculated. N=0 preserves exact prior behavior.
             let dflash_resume_guard = sched.levers.dflash_resume_guard;
-            // ATLAS_DFLASH_SPEC_THINK=1: speculate INSIDE think blocks (vLLM
-            // semantics — reference measures 45% draft acceptance on thinking,
-            // 2026-07-07 calibration). Bypasses the think-gate AND the resume
-            // guard: output is coherent but not byte-lossless vs no-spec (the
-            // batch-K numerics floor can flip a low-margin token mid-think),
-            // and thinking-budget forced-end is not enforced on the raw-argmax
-            // verify path. Throughput mode; leave OFF for byte-proof runs.
+            // ATLAS_DFLASH_SPEC_THINK=1: DFlash raw-argmax may speculate
+            // inside `<think>`. Standard MTP already verifies during think
+            // (ForcedThinkEndInjector stays on that path). DFlash raw-argmax
+            // does not, so it stays serial-in-think unless this lever is on.
+            // Resume guard still serial-decodes the spec-entry window.
+            // Output is coherent but not byte-lossless vs no-spec (the
+            // batch-K numerics floor can flip a low-margin token mid-think).
+            // Throughput mode; leave OFF for byte-proof DFlash runs.
             let dflash_spec_think = sched.levers.dflash_spec_think;
             // Spec dispatch additionally requires every active sequence's
             // SSM slot to be covered by the MTP verify state pools
@@ -692,24 +697,23 @@ pub fn run(
                 && spec_width_ok
                 && spec_slots_covered
                 && (
-                    // SPEC_THINK: speculate everywhere EXCEPT the first
-                    // `dflash_resume_guard` generated tokens — every observed
-                    // T=0 flip (2026-07-07/08) fires within ~7 tokens of spec
-                    // ENTRY (sequence start or post-think resume); serial-
-                    // decoding the entry window dodges the divergence while
-                    // leaving the body speculated.
-                    // EVERY active sequence must be eligible, not just active[0].
-                    // These are per-sequence properties: with more than one
-                    // sequence speculating, reading them off active[0] lets
-                    // sequence 1 be speculated while its own suppress_tool_call
-                    // / disable_mtp / thinking state says it must not be. At
-                    // n==1 `all()` over one element is exactly the old
-                    // predicate, so the single-sequence path is unchanged.
+                    // Standard MTP verifies during `<think>` (same machine as
+                    // thinking-off). DFlash raw-argmax stays serial-in-think
+                    // unless ATLAS_DFLASH_SPEC_THINK=1 — that path does not
+                    // run thinking-budget forced-end. Resume guard still
+                    // serial-decodes the spec-entry window. EVERY active
+                    // sequence must be eligible, not just active[0].
                     active.iter().all(|a| {
-                        ((dflash_spec_think && a.output_tokens.len() as u32 >= dflash_resume_guard)
-                            || (!a.inside_thinking && a.post_think_emitted >= dflash_resume_guard))
-                            && !a.suppress_tool_call
-                            && !a.disable_mtp
+                        mtp_spec_eligible(
+                            a.inside_thinking,
+                            a.post_think_emitted,
+                            a.output_tokens.len() as u32,
+                            a.suppress_tool_call,
+                            a.disable_mtp,
+                            dflash_spec_think,
+                            dflash_resume_guard,
+                            dflash_verify_raw_argmax,
+                        )
                     })
                 )
             {
@@ -723,7 +727,11 @@ pub fn run(
                 // A/B 2026-07-20: always-on Σ1028s/10-10 vs timing-gated
                 // Σ1846s/9-10).
                 if let Some(gate) = mtp_gate.as_mut() {
-                    gate.maybe_remeasure(active[0].seq.seq_len);
+                    if gate.maybe_remeasure(active[0].seq.seq_len) {
+                        for a in active.iter_mut() {
+                            a.decode_acct.note_regime_reprobe();
+                        }
+                    }
                     gate.note_depth(active[0].seq.seq_len);
                     match gate.next_step() {
                         mtp_gate::GateStep::MeasureDecode => {
@@ -740,6 +748,9 @@ pub fn run(
                                 &sched,
                             );
                             gate.record_decode(t0.elapsed());
+                            for a in active.iter_mut() {
+                                a.decode_acct.record_serial();
+                            }
                             // ATLAS_MTP_CATCHUP: ring the serially decoded
                             // token's hidden so the next MTP re-probe can
                             // batch-feed the drafter over the serial gap
@@ -791,7 +802,8 @@ pub fn run(
                             // on tokens-per-second, so counting only active[0]
                             // under-reports MTP's throughput by a factor of n and
                             // biases the gate toward serial decode.
-                            let seq_len_before: usize = active.iter().map(|a| a.seq.seq_len).sum();
+                            let lens_before: Vec<usize> =
+                                active.iter().map(|a| a.seq.seq_len).collect();
                             let t0 = std::time::Instant::now();
                             step_mtp(
                                 &*model,
@@ -801,9 +813,16 @@ pub fn run(
                                 &verify_ctx,
                                 dflash_verify_raw_argmax,
                             );
-                            let seq_len_after: usize = active.iter().map(|a| a.seq.seq_len).sum();
-                            let emitted = seq_len_after.saturating_sub(seq_len_before);
+                            let emitted: usize = active
+                                .iter()
+                                .zip(lens_before.iter())
+                                .map(|(a, &b)| a.seq.seq_len.saturating_sub(b))
+                                .sum();
                             gate.record_verify_step(t0.elapsed(), emitted);
+                            for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                                a.decode_acct
+                                    .record_mtp_emitted(a.seq.seq_len.saturating_sub(b));
+                            }
                         }
                     }
                     // One-time transition work when the gate switches to
@@ -822,6 +841,7 @@ pub fn run(
                     }
                 } else {
                     // Gate bypassed (ATLAS_MTP_GATE_FORCE=1): plain MTP.
+                    let lens_before: Vec<usize> = active.iter().map(|a| a.seq.seq_len).collect();
                     step_mtp(
                         &*model,
                         &mut active,
@@ -830,6 +850,10 @@ pub fn run(
                         &verify_ctx,
                         dflash_verify_raw_argmax,
                     );
+                    for (a, &b) in active.iter_mut().zip(lens_before.iter()) {
+                        a.decode_acct
+                            .record_mtp_emitted(a.seq.seq_len.saturating_sub(b));
+                    }
                 }
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.
@@ -857,6 +881,9 @@ pub fn run(
                     adaptive_sampling,
                     &sched,
                 );
+                for a in active.iter_mut() {
+                    a.decode_acct.record_serial();
+                }
             }
         }
 

@@ -26,9 +26,16 @@
 //! - While in Serial, re-probe MTP after [`reprobe_tokens`] emitted tokens.
 //!   While in Mtp, refresh the serial baseline after
 //!   [`serial_refresh_tokens`] (one window ≈ ≤0.3% overhead bound).
-//! - A depth-regime change (factor [`REMEASURE_DEPTH_FACTOR`]) marks the
-//!   OTHER mode's baseline stale and schedules a refresh probe instead of
-//!   wiping all state.
+//! - A depth-regime change (factor [`REMEASURE_DEPTH_FACTOR`] = 2, floor
+//!   [`REMEASURE_DEPTH_FLOOR`] = 512 — first crossing at 1024; a 2048-token
+//!   3.8 think can cross twice, 4× from the floor) marks baselines stale.
+//!   The shipped gate (#337 / #344 / #242 / d6171c4) also pulled the next
+//!   probe forward. That pull-forward is removed here: a long think must
+//!   stay on the current mode. The other mode refreshes on its normal
+//!   cadence. A stale other-mode EWMA cannot win a switch (that is how a
+//!   short-context serial baseline used to dump a long think into serial).
+//!   This is not a new gate and does not close a 2× decode-wall report
+//!   (#519 is GEMV LUT staging, ~13%, a different machine).
 //!
 //! `ATLAS_MTP_GATE_FORCE=1` (existing) bypasses the gate entirely.
 
@@ -161,6 +168,8 @@ pub struct MtpGate {
     observed_depth: usize,
     measured_at_depth: usize,
     fresh: Option<GateDecision>,
+    /// Depth-regime changes observed this serve (Done-line / tests).
+    regime_reprobes: usize,
 }
 
 impl MtpGate {
@@ -211,6 +220,7 @@ impl MtpGate {
             observed_depth: 0,
             measured_at_depth: 0,
             fresh: None,
+            regime_reprobes: 0,
         }
     }
 
@@ -220,22 +230,24 @@ impl MtpGate {
 
     /// Depth-regime change: mark BOTH baselines stale (economics moved) and
     /// let the normal probe cadence refresh them — no state wipe, no forced
-    /// serial phase.
-    pub fn maybe_remeasure(&mut self, current_depth: usize) {
+    /// serial phase. Returns true when a regime change fired.
+    pub fn maybe_remeasure(&mut self, current_depth: usize) -> bool {
         let measured = self.measured_at_depth.max(REMEASURE_DEPTH_FLOOR);
         let live = current_depth.max(REMEASURE_DEPTH_FLOOR);
         if live >= measured * REMEASURE_DEPTH_FACTOR || measured >= live * REMEASURE_DEPTH_FACTOR {
             tracing::info!(
                 "MTP gate: depth regime changed ({} -> {} tokens); baselines stale, \
-                 will re-probe on cadence",
+                 staying in current mode until the normal probe cadence",
                 self.measured_at_depth,
                 current_depth,
             );
             self.mtp.stale = true;
             self.serial.stale = true;
             self.measured_at_depth = current_depth;
-            // Refresh the off-mode soon rather than waiting a full interval.
-            self.tokens_since_event = self.tokens_since_event.max(self.event_interval());
+            self.regime_reprobes = self.regime_reprobes.saturating_add(1);
+            true
+        } else {
+            false
         }
     }
 
@@ -346,6 +358,16 @@ impl MtpGate {
         let (Some(mtp), Some(serial)) = (self.mtp.tps, self.serial.tps) else {
             return; // need both baselines before any switch
         };
+        // A stale other-mode EWMA is a measurement from a different depth
+        // regime. Switching onto it is how a short-context serial baseline
+        // used to dump a long think into serial for a full reprobe interval.
+        let other_stale = match self.mode {
+            Mode::Mtp => self.serial.stale,
+            Mode::Serial => self.mtp.stale,
+        };
+        if other_stale {
+            return;
+        }
         let (cur, other, other_dev) = match self.mode {
             Mode::Mtp => (mtp, serial, self.serial.dev),
             Mode::Serial => (serial, mtp, self.mtp.dev),
@@ -392,6 +414,12 @@ impl MtpGate {
     }
     pub fn in_serial_mode(&self) -> bool {
         self.mode == Mode::Serial
+    }
+    pub fn regime_reprobe_count(&self) -> usize {
+        self.regime_reprobes
+    }
+    pub fn is_probing(&self) -> bool {
+        self.probing
     }
 }
 
